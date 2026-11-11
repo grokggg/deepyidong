@@ -1,0 +1,954 @@
+/**
+ * Task notifications: real shared channel lifecycle, focus policy, terminal
+ * detection, native titles, OSC 9/99/777 framing and redirected-output safety.
+ * No live backend.
+ * Run: node --import tsx/esm scripts/verify-task-notifications.ts
+ */
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { setImmediate as nextDispatch } from 'node:timers/promises'
+import { PassThrough, Writable } from 'node:stream'
+import { fileURLToPath } from 'node:url'
+import type { AgentEvent, AgentEventMeta, AgentEventOf, PermissionRequestView, TurnEndReason } from '../src/agent/events.js'
+import type { AgentSession, AgentSessionStatus } from '../src/agent/session.js'
+import { attachInteraction } from '../src/channel/interaction.js'
+import { PermissionStore } from '../src/channel/permissions.js'
+import { QuestionStore } from '../src/channel/questions.js'
+import { createChannel } from '../src/dsh-adapter/channel.js'
+import { Config } from '../src/dsh-adapter/index.js'
+import {
+  approvalNotificationMessage,
+  backendApprovalNotice,
+  dshApprovalNotice,
+  notificationAlertsEnabled,
+  notificationDispatchAllowed,
+  questionNotificationMessage,
+  questionNotice,
+  waitingQuestionNotice,
+} from '../src/dsh-adapter/plugin.js'
+import { configValues } from '../src/dsh-adapter/compat/settings.js'
+import { stringWidth } from '../src/ink/stringWidth.js'
+import { clipToWidthGraphemes, createTerminalNotifier } from '../src/ink/terminal-notification.js'
+import { getTerminalFocusState, resetTerminalFocusState, setTerminalFocused } from '../src/ink/terminal-focus-state.js'
+import { setXtversionName, getNotificationProtocol, resolveNotificationMethod } from '../src/ink/terminal.js'
+import { osc, wrapForMultiplexer } from '../src/ink/termio/osc.js'
+import { SETTING_DEFINITIONS } from '../src/settings/definitions.js'
+import { getGraphemeSegmenter } from '../src/utils/intl.js'
+import { setLang, t } from '../src/i18n.js'
+
+/** The plugin entry whose sparse /settings schema mirrors this Config. */
+const pluginEntry = fileURLToPath(new URL('../src/dsh-adapter/plugin.ts', import.meta.url))
+
+/** The notification methods the Config schema accepts, in the order it declares them. */
+function acceptedNotificationMethods(): string[] {
+  const field = Config.dict?.['notificationMethod']
+  assert.equal(field?.type, 'union', 'notificationMethod is a union of literal methods')
+  return (field?.list ?? []).map(entry => {
+    assert.equal(entry.type, 'const', 'every accepted notification method is one literal')
+    return entry.value as string
+  })
+}
+
+const savedEnv = { TERM_PROGRAM: process.env.TERM_PROGRAM, TERM: process.env.TERM, TMUX: process.env.TMUX, STY: process.env.STY }
+const writes: string[] = []
+const stdout = Object.assign(new Writable({
+  write(chunk, _encoding, done) { writes.push(String(chunk)); done() },
+}), { isTTY: true })
+const notifier = createTerminalNotifier(stdout)
+
+class FakeSession implements AgentSession {
+  readonly ref
+  readonly cwd = process.cwd()
+  status: AgentSessionStatus = 'idle'
+  readonly capabilities = { native: {} }
+  readonly listeners = new Set<(batch: readonly AgentEvent[], meta: AgentEventMeta) => void>()
+  constructor(id: string) { this.ref = { backendId: 'fake', sessionId: id } }
+  history = async (): Promise<readonly AgentEvent[]> => []
+  subscribe(listener: (batch: readonly AgentEvent[], meta: AgentEventMeta) => void) {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+  submit = async () => ({ accepted: true })
+  cancel = async () => ({ stillQueued: [], outcome: 'confirmed' as const })
+  dispose = async () => {}
+  emit(batch: readonly AgentEvent[], replay = false): void {
+    for (const listener of this.listeners) listener(batch, { replay, wake: 'none' })
+  }
+  start(turn: number): void {
+    this.status = 'running'
+    this.emit([{ type: 'session.status', status: 'running' }, { type: 'turn.start', turn, origin: 'user', time: turn }])
+  }
+  reply(turn: number, text: string, seq: number, extra: Partial<AgentEventOf<'assistant.message'>> = {}): void {
+    this.emit([{
+      type: 'assistant.message', turn, step: seq, seq, anchor: String(seq),
+      attemptId: `reply-${seq}`, time: turn, canonical: true,
+      blocks: [{ type: 'text', text }], ...extra,
+    }])
+  }
+  end(turn: number, reason: TurnEndReason = { kind: 'completed' }): void {
+    this.emit([{ type: 'turn.end', turn, reason, time: turn + 1 }])
+  }
+  idle(): void {
+    this.status = 'idle'
+    this.emit([{ type: 'session.status', status: 'idle' }])
+  }
+}
+
+const ctx = {
+  on: () => () => undefined,
+  get: () => undefined,
+  logger: { warn: () => undefined, info: () => undefined, debug: () => undefined },
+} as never
+const first = new FakeSession('first')
+const second = new FakeSession('second')
+let completed = 0
+const channel = createChannel(ctx, first, {
+  model: 'fake', provider: '', cwd: first.cwd, activity: false,
+  openSession: async () => second,
+  onTaskComplete: preview => { completed += 1; notifier.notify(t('task-complete-notification'), preview) },
+})
+
+try {
+  delete process.env.TMUX
+  delete process.env.STY
+  delete process.env.TERM_PROGRAM
+  process.env.TERM = 'xterm-256color'
+  setLang('en')
+  // The untitled-session placeholder is localized like the rest of the body.
+  assert.equal(approvalNotificationMessage('', 'Bash', 'needs write access'), 'Untitled session：Bash：needs write access')
+  assert.equal(questionNotificationMessage([{ id: 'database', header: 'Database', question: 'Which one?' }]), 'Database：Which one?')
+  assert.equal(t('question-notification'), 'dsh-TUI · Waiting for your answer')
+  assert.equal(t('plan-review-notification'), 'dsh-TUI · Plan review')
+  resetTerminalFocusState()
+  notifier.notify('done')
+  assert.deepEqual(writes, [], 'unknown focus stays quiet with the default policy')
+  setTerminalFocused(false)
+  notifier.notify('done')
+  assert.equal(writes.pop(), '\x07', 'unknown terminal falls back to BEL')
+  for (const [program, protocol, expected] of [
+    ['ghostty', 'osc777', osc(777, 'notify', 'Task complete', 'done')],
+    ['iTerm.app', 'osc9', osc(9, 'Task complete: done')],
+    ['kitty', 'osc99', osc(99, 'i=1:d=0:p=title', 'Task complete') + osc(99, 'i=1:d=1:p=body', 'done')],
+    ['WarpTerminal', 'osc9', osc(9, 'Task complete: done')],
+    ['WezTerm', 'osc777', osc(777, 'notify', 'Task complete', 'done')],
+  ]) {
+    process.env.TERM_PROGRAM = program
+    notifier.notify('Task complete', 'done')
+    assert.equal(getNotificationProtocol(), protocol)
+    for (const platform of ['darwin', 'linux'] as const) {
+      assert.equal(resolveNotificationMethod('auto', platform), protocol, `${program} keeps its protocol for auto off Windows (${platform})`)
+    }
+    assert.equal(writes.pop(), expected, `${program} preserves the title and reply`)
+  }
+  process.env.TERM_PROGRAM = 'ghostty'
+  notifier.notify('Task; complete\x07', 'reply; with; semicolons\x1b]2;injected\x07')
+  assert.equal(writes.pop(), osc(777, 'notify', 'Task  complete', 'reply; with; semicolons]2;injected'), 'OSC 777 cannot inject title fields or control sequences; reply semicolons survive')
+  process.env.TMUX = '/tmp/fixture,1,0'
+  notifier.notify('Task complete', 'reply')
+  assert.equal(writes.pop(), wrapForMultiplexer(osc(777, 'notify', 'Task complete', 'reply')))
+  delete process.env.TMUX
+  const notificationTitle = 'dsh-TUI · Task complete'
+  const header = osc(777, 'notify', notificationTitle, '')
+  const oscEnd = header.endsWith('\x07') ? '\x07' : '\x1b\\'
+  const oscPrefix = header.slice(0, -oscEnd.length)
+  const bodyBudget = 2048 - Buffer.byteLength(header)
+  const assertReceiverBudget = (data: string): void => {
+    assert.ok(Buffer.byteLength(`\x1b]777;${data}${oscEnd}`) <= 2048, 'headless receiver enforces the complete OSC byte budget')
+  }
+  const receiverOverhead = Buffer.byteLength(`\x1b]777;${oscEnd}`)
+  assert.doesNotThrow(() => assertReceiverBudget('a'.repeat(2048 - receiverOverhead)))
+  for (const packetBytes of [2049, 2050]) {
+    assert.throws(() => assertReceiverBudget('a'.repeat(packetBytes - receiverOverhead)), { code: 'ERR_ASSERTION' }, 'receiver must count the OSC introducer and terminator')
+  }
+  const deliveredBody = (packet: string): string => {
+    assert.ok(packet.startsWith(oscPrefix))
+    assert.ok(packet.endsWith(oscEnd))
+    assert.ok(Buffer.byteLength(packet) <= 2048, 'full OSC 777 packet fits Ghostty, including title and terminator')
+    return packet.slice(oscPrefix.length, -oscEnd.length)
+  }
+  notifier.notify(notificationTitle, 'a'.repeat(bodyBudget))
+  const exactPacket = writes.pop()!
+  assert.equal(Buffer.byteLength(exactPacket), 2048)
+  assert.equal(deliveredBody(exactPacket), 'a'.repeat(bodyBudget), 'exact byte boundary does not truncate')
+  notifier.notify(notificationTitle, 'a'.repeat(bodyBudget + 1))
+  assert.equal(deliveredBody(writes.pop()!), `${'a'.repeat(bodyBudget - 3)}…`, 'ellipsis counts against the UTF-8 byte budget')
+  for (const grapheme of ['👨‍👩‍👧‍👦', `e${'\u0301'.repeat(12)}`]) {
+    notifier.notify(notificationTitle, grapheme.repeat(200))
+    const body = deliveredBody(writes.pop()!)
+    assert.ok(body.endsWith('…'))
+    assert.ok([...getGraphemeSegmenter().segment(body.slice(0, -1))].every(part => part.segment === grapheme), 'byte truncation preserves whole emoji and combining graphemes')
+  }
+  notifier.notify(notificationTitle, `e${'\u0301'.repeat(2000)}`)
+  assert.equal(deliveredBody(writes.pop()!), '…', 'a single oversized grapheme is omitted whole')
+  const byteSession = new FakeSession('ghostty-byte-budget')
+  const byteChannel = createChannel(ctx, byteSession, {
+    model: 'fake', provider: '', cwd: byteSession.cwd, activity: false,
+    onTaskComplete: preview => notifier.notify(notificationTitle, preview),
+  })
+  try {
+    byteSession.start(0)
+    byteSession.reply(0, '👨‍👩‍👧‍👦'.repeat(200), 1)
+    byteSession.end(0)
+    byteSession.idle()
+    await nextDispatch()
+    assert.ok(deliveredBody(writes.pop()!).endsWith('…'), 'real completion and preview generation also obey the Ghostty byte limit')
+  } finally {
+    byteChannel.releaseContributions()
+  }
+  process.env.TMUX = '/tmp/fixture,1,0'
+  notifier.notify(notificationTitle, '👨‍👩‍👧‍👦'.repeat(200))
+  const wrappedPacket = writes.pop()!
+  assert.ok(wrappedPacket.startsWith('\x1bPtmux;') && wrappedPacket.endsWith('\x1b\\'))
+  assert.ok(deliveredBody(wrappedPacket.slice('\x1bPtmux;'.length, -2).replaceAll('\x1b\x1b', '\x1b')).endsWith('…'), 'byte cap applies to the OSC forwarded by tmux, before DCS wrapping')
+  delete process.env.TMUX
+  notifier.notify('x'.repeat(3000), 'reply')
+  assert.ok(Buffer.byteLength(writes.pop()!) <= 2048, 'an oversized title also respects the packet budget')
+  process.env.TERM_PROGRAM = 'kitty'
+  const longReply = '👨‍👩‍👧‍👦'.repeat(200)
+  notifier.notify('Task complete', longReply)
+  const kittyPacket = writes.pop()!
+  const terminator = osc(99, '').endsWith('\x07') ? '\x07' : '\x1b\\'
+  const parts = kittyPacket.split(terminator).filter(Boolean).map(part => {
+    assert.ok(part.startsWith('\x1b]99;'))
+    const split = part.indexOf(';', '\x1b]99;'.length)
+    return { metadata: part.slice('\x1b]99;'.length, split), payload: part.slice(split + 1) }
+  })
+  assert.equal(parts[0]!.payload, 'Task complete')
+  assert.ok(parts.slice(0, -1).every(part => part.metadata.includes('i=2:d=0:')))
+  assert.equal(parts.at(-1)!.metadata, 'i=2:d=1:p=body')
+  assert.ok(parts.every(part => Buffer.byteLength(part.payload) <= 2048), 'Kitty payloads respect the protocol byte cap')
+  assert.equal(parts.slice(1).map(part => part.payload).join(''), longReply, 'Kitty UTF-8 chunking preserves the entire Unicode preview')
+  for (const program of ['Apple_Terminal', 'vscode', 'Windows_Terminal', 'Alacritty']) {
+    process.env.TERM_PROGRAM = program
+    assert.equal(getNotificationProtocol(), 'bel', `${program} falls back to BEL`)
+  }
+  delete process.env.TERM_PROGRAM
+  for (const term of ['xterm-kitty', 'xterm-ghostty']) {
+    process.env.TERM = term
+    assert.equal(getNotificationProtocol(), term === 'xterm-kitty' ? 'osc99' : 'osc777')
+  }
+  process.env.TERM = 'xterm-256color'
+  // `auto` asks the platform: the native toast on Windows (D2), the same
+  // terminal protocol as before everywhere else (D12/AC-7). The platform is an
+  // argument, so a Windows host asserts the POSIX paths too.
+  for (const [method, expected] of [['auto', 'windows'], ['windows', 'windows'], ['osc9', 'osc9'], ['bel', 'bel']] as const) {
+    assert.equal(resolveNotificationMethod(method, 'win32', {}), expected, `${method} on win32`)
+  }
+  process.env.TERM_PROGRAM = 'ghostty'
+  assert.equal(resolveNotificationMethod('windows', 'darwin'), 'osc777', 'an explicit windows is not a POSIX transport')
+  for (const variable of ['SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY']) {
+    const env = { [variable]: 'remote-session' }
+    assert.equal(resolveNotificationMethod('auto', 'win32', env), 'osc777', `${variable}: auto notifies the attached terminal, not the remote Windows desktop`)
+    assert.equal(resolveNotificationMethod('windows', 'win32', env), 'windows', 'an explicit native transport remains an override')
+  }
+  delete process.env.TERM_PROGRAM
+  notifier.configure('always', 'osc9')
+  setTerminalFocused(true)
+  process.env.TMUX = '/tmp/fixture,1,0'
+  notifier.notify('done\x07\x1b\\\x9c')
+  assert.equal(writes.pop(), wrapForMultiplexer(osc(9, 'done\\')), 'control bytes cannot terminate or inject OSC/tmux payloads')
+  delete process.env.TMUX
+  notifier.notify('Task complete', 'latest reply')
+  assert.equal(writes.pop(), osc(9, 'Task complete: latest reply'), 'explicit OSC 9 retains a title prefix')
+  notifier.notify(notificationTitle, longReply)
+  assert.ok(Buffer.byteLength(writes.pop()!) <= 2048, 'explicit OSC 9 also fits Ghostty when used as a compatibility override')
+  notifier.configure('off', 'osc9')
+  notifier.notify('done')
+  stdout.isTTY = false
+  notifier.configure('always', 'osc9')
+  notifier.notify('done')
+  assert.deepEqual(writes, [], 'disabled and redirected output never receives notifications')
+  stdout.isTTY = true
+  const failing = createTerminalNotifier({ isTTY: true, write: () => { throw new Error('closed') } })
+  failing.configure('always')
+  assert.doesNotThrow(() => failing.notify('done'), 'notification failures do not fail the turn')
+  notifier.configure('always', 'bel')
+  notifier.notify('done')
+  assert.equal(writes.pop(), '\x07', 'explicit BEL overrides detection')
+  notifier.configure('always', 'windows')
+  notifier.notify('done')
+  assert.equal(writes.pop(), '\x07', 'an explicit windows is not a terminal sequence and resolves like auto')
+  assert.equal(configValues(Config({ taskNotifications: 'off', notificationMethod: 'osc9' })).taskNotifications, 'off')
+  assert.equal(configValues(Config({ notificationMethod: 'windows' })).notificationMethod, 'windows', 'windows joins the accepted notification methods')
+  assert.throws(() => configValues(Config({ notificationMethod: 'unknown' })))
+  assert.equal(configValues(Config({})).taskNotifications, undefined, 'unset schema does not shadow deployment settings')
+  // The method's value domain is written in four places (F1): the type
+  // (`ink/terminal-notification.ts`), this Config schema, the sparse /settings
+  // schema in `plugin.ts`, and the option list `/settings` renders from. The type
+  // carries the two schemas - both are typed by it - but the option list is typed
+  // `value: string`, so a method missing there compiles, passes every gate and is
+  // simply never offered. That is the one mirror nothing else compares.
+  const acceptedMethods = acceptedNotificationMethods()
+  assert.deepEqual(
+    (SETTING_DEFINITIONS.notificationMethod.options ?? []).map(option => option.value).sort(),
+    [...acceptedMethods].sort(),
+    '/settings offers exactly the notification methods the config accepts (F1)',
+  )
+  // The sparse schema is a local `Schema.object` inside `apply()`, so no import
+  // reaches it; its source text is the only form left to compare against.
+  const sparse = /notificationMethod: Schema\.union\(\[([^\]]*)\]\)/u.exec(readFileSync(pluginEntry, 'utf8'))
+  assert.ok(sparse !== null, 'plugin.ts still declares the sparse notificationMethod schema')
+  assert.deepEqual(
+    [...sparse[1]!.matchAll(/'([^']*)'/gu)].map(match => match[1]).sort(),
+    [...acceptedMethods].sort(),
+    'the sparse /settings schema accepts the same methods (F1)',
+  )
+
+  notifier.configure('unfocused', 'osc9')
+  setTerminalFocused(false)
+  first.emit([{ type: 'turn.end', turn: 0, reason: { kind: 'completed' }, time: 1 }], true)
+  await nextDispatch()
+  assert.equal(completed, 0, 'replay does not notify')
+  first.start(1)
+  first.end(1)
+  await nextDispatch()
+  assert.equal(completed, 0, 'turn.end waits for the session to become idle')
+  first.idle()
+  await nextDispatch()
+  assert.equal(completed, 1)
+  assert.equal(writes.pop(), osc(9, 'dsh-TUI · Task complete'))
+  first.end(1)
+  first.emit([], false)
+  await nextDispatch()
+  assert.equal(completed, 1, 'duplicate end and quiet batches do not repeat a notification')
+  for (const [turn, reason] of [[2, { kind: 'aborted' }], [3, { kind: 'interrupted' }], [4, { kind: 'error', message: 'fixture' }]] as const) {
+    first.start(turn)
+    first.end(turn, reason)
+    first.idle()
+    await nextDispatch()
+    assert.equal(completed, 1, `${reason.kind} stays quiet`)
+  }
+  first.start(5)
+  first.reply(5, 'Intermediate reply', 50)
+  channel.submit('follow up')
+  // Submission resolves into the channel's pending preview.
+  await nextDispatch()
+  assert.ok(channel.pending.length > 0)
+  first.end(5)
+  first.idle()
+  await nextDispatch()
+  assert.equal(completed, 1, 'queued inputs suppress intermediate completion')
+  first.start(6)
+  first.emit([{ type: 'pending.changed', items: [], claimed: channel.pending.map(item => item.id) }])
+  first.reply(6, 'Final follow-up reply', 60)
+  first.end(6)
+  first.idle()
+  await nextDispatch()
+  assert.equal(completed, 2, 'the last queued turn notifies')
+  assert.equal(writes.pop(), osc(9, 'dsh-TUI · Task complete: Final follow-up reply'), 'the last queued turn supplies its own reply under the title')
+  first.start(7)
+  first.emit([{ type: 'goal.change', operation: 'set', goal: { id: 'goal', revision: 1, objective: 'fixture', phase: 'active', maxGoalRounds: 5 } }])
+  first.end(7)
+  first.idle()
+  await nextDispatch()
+  assert.equal(completed, 2, 'active goals suppress intermediate completion')
+  first.start(8)
+  first.emit([{ type: 'goal.change', operation: 'complete', goal: { id: 'goal', revision: 2, objective: 'fixture', phase: 'complete', maxGoalRounds: 5 } }])
+  first.end(8)
+  first.idle()
+  setTerminalFocused(true)
+  await nextDispatch()
+  assert.equal(completed, 3)
+  assert.deepEqual(writes, [], 'focus is checked at delivery after the final goal turn')
+  first.start(9)
+  first.end(9)
+  first.idle()
+  const retired = [...first.listeners]
+  assert.equal(await channel.newSession(), true)
+  for (const listener of retired) listener([{ type: 'turn.end', turn: 10, reason: { kind: 'completed' }, time: 11 }], { replay: false })
+  await nextDispatch()
+  assert.equal(completed, 3, 'session switch fences scheduled and retained old callbacks')
+  second.start(0)
+  second.end(0)
+  second.idle()
+  await nextDispatch()
+  assert.equal(completed, 4, 'turn numbering restarts with the replacement session')
+  second.start(1)
+  second.end(1)
+  second.idle()
+  second.emit([{ type: 'session.reset', trigger: 'fixture' }])
+  await nextDispatch()
+  assert.equal(completed, 4, 'conversation reset cancels pending delivery')
+  second.start(0)
+  second.end(0)
+  second.idle()
+  second.start(1)
+  await nextDispatch()
+  assert.equal(completed, 4, 'an automatic follow-up that starts immediately stays quiet')
+  second.end(1)
+  second.idle()
+  await nextDispatch()
+  assert.equal(completed, 5, 'the final follow-up notifies after conversation reset')
+  second.start(2)
+  second.end(2)
+  second.idle()
+  channel.releaseContributions()
+  await nextDispatch()
+  assert.equal(completed, 5, 'channel disposal cancels pending delivery')
+
+  const previews: (string | undefined)[] = []
+  const replySession = new FakeSession('reply-preview')
+  // An adopted running session may finish before any live turn.start is seen.
+  replySession.status = 'running'
+  const replyChannel = createChannel(ctx, replySession, {
+    model: 'fake', provider: '', cwd: replySession.cwd, activity: false,
+    onTaskComplete: preview => { previews.push(preview) },
+  })
+  try {
+    replySession.reply(0, '  First draft  ', 1)
+    replySession.reply(0, 'ignored', 2, { blocks: [
+      { type: 'reasoning', text: 'private reasoning' },
+      { type: 'text', text: '  最新\n\t回复 ' },
+      { type: 'text', text: '已\x1b[31m完成\x1b[0m。' },
+    ] })
+    replySession.reply(0, 'Old duplicate', 1)
+    replySession.reply(0, 'Child reply', 3, { parentCallId: 'child' })
+    replySession.reply(0, 'Interrupted reply', 4, { interrupted: true })
+    replySession.reply(0, '', 5, { blocks: [{ type: 'tool_use' }] })
+    replySession.end(0)
+    replySession.idle()
+    await nextDispatch()
+    assert.equal(previews.at(-1), '最新 回复 已完成。', 'latest settled main reply wins; controls/whitespace are normalized and reasoning is excluded')
+
+    const family = '👨‍👩‍👧‍👦'
+    replySession.start(1)
+    replySession.reply(1, family.repeat(200), 6)
+    replySession.end(1)
+    replySession.idle()
+    await nextDispatch()
+    assert.equal(previews.at(-1), family.repeat(200), 'exactly 200 graphemes do not truncate')
+    replySession.start(2)
+    replySession.reply(2, `${family.repeat(198)}e\u0301remaining text`, 7)
+    replySession.end(2)
+    replySession.idle()
+    await nextDispatch()
+    assert.equal(previews.at(-1), `${family.repeat(198)}e\u0301…`, 'truncation preserves emoji and combining graphemes')
+
+    replySession.start(3)
+    replySession.reply(3, '', 8, { blocks: [{ type: 'reasoning', text: 'private reasoning' }] })
+    replySession.end(3)
+    replySession.idle()
+    await nextDispatch()
+    assert.equal(previews.at(-1), undefined, 'a turn without reply text does not reuse a previous turn')
+    replySession.start(4)
+    replySession.emit([
+      { type: 'assistant.attempt.start', attemptId: 'abandoned', turn: 4, step: 0 },
+      { type: 'assistant.delta', attemptId: 'abandoned', index: 0, time: 4, delta: { kind: 'text', text: 'uncommitted draft' } },
+      { type: 'assistant.attempt.end', attemptId: 'abandoned', outcome: 'abandoned', turn: 4, step: 0 },
+    ])
+    replySession.end(4)
+    replySession.idle()
+    await nextDispatch()
+    assert.equal(previews.at(-1), undefined, 'abandoned streamed text never becomes a notification')
+    replySession.start(5)
+    replySession.reply(5, '# Review verdict **结论：通过**\n\n修复了 `src/foo.ts`，[详情](https://example.invalid)。', 9)
+    replySession.end(5)
+    replySession.idle()
+    await nextDispatch()
+    assert.equal(previews.at(-1), 'Review verdict 结论：通过 修复了 src/foo.ts，详情。', 'Markdown headings and emphasis become plain text before the desktop can enlarge them')
+    replySession.start(6)
+    replySession.reply(6, '# 标题\n\n> **重点**\n\n- 检查 `foo`\n- 检查 bar\n\n```ts\nconst value = 1\n```\n\n| 项目 | 状态 |\n| --- | --- |\n| 编译 | 通过 |', 10)
+    replySession.end(6)
+    replySession.idle()
+    await nextDispatch()
+    assert.equal(previews.at(-1), '标题 重点 检查 foo 检查 bar const value = 1 项目 状态 编译 通过', 'block boundaries survive as spaces without list/table/fence markup')
+    replySession.start(7)
+    replySession.reply(7, `<h1>正文</h1>\n\n**${family.repeat(200)}**`, 11)
+    replySession.end(7)
+    replySession.idle()
+    await nextDispatch()
+    assert.equal(previews.at(-1), `正文 ${family.repeat(196)}…`, 'HTML and Markdown styles are removed before Unicode-safe truncation')
+    assert.equal(previews.length, 8)
+  } finally {
+    replyChannel.releaseContributions()
+  }
+  setXtversionName('Ghostty 1.2.0')
+  assert.equal(getNotificationProtocol(), 'osc777', 'existing terminal probe supports native titles over SSH without TERM_PROGRAM')
+  setLang('zh')
+  assert.equal(t('task-complete-notification'), 'dsh-TUI · 任务已完成')
+  assert.equal(t('approval-notification'), 'dsh-TUI · 等待授权')
+  assert.equal(t('question-notification'), 'dsh-TUI · 等待回答')
+  assert.equal(t('plan-review-notification'), 'dsh-TUI · 计划评审')
+  // The approval toast body is the session, the tool and the asker's reason, in
+  // that order: a missing part is dropped instead of leaving an empty field, and
+  // a prompt with nothing to say announces nothing. The gated command and the
+  // tool input stay on the request and never enter this function, so a
+  // command-bearing prompt still produces the plain body below.
+  assert.equal(approvalNotificationMessage(' 会话 A ', ' Bash ', ' 需要执行命令 '), '会话 A：Bash：需要执行命令')
+  assert.equal(approvalNotificationMessage('会话 A', 'Bash', '需要执行命令'), '会话 A：Bash：需要执行命令')
+  assert.equal(approvalNotificationMessage('会话 A', 'Bash'), '会话 A：Bash')
+  assert.equal(approvalNotificationMessage('会话 A', 'Bash', '   '), '会话 A：Bash')
+  assert.equal(approvalNotificationMessage('', 'Bash', '需要执行命令'), '未命名会话：Bash：需要执行命令')
+  assert.equal(approvalNotificationMessage('   ', '\t', '  '), '未命名会话')
+  assert.equal(approvalNotificationMessage('', 'Bash', '需要写文件'), '未命名会话：Bash：需要写文件')
+  const gatedApproval: PermissionRequestView = {
+    requestId: 'gated',
+    toolName: 'Bash',
+    reason: '需要执行命令',
+    command: 'rm -rf / --no-preserve-root',
+    input: { apiKey: 'sk-live-not-for-a-toast' },
+  }
+  assert.equal(approvalNotificationMessage('会话 A', gatedApproval.toolName, gatedApproval.reason), '会话 A：Bash：需要执行命令', 'the body names the ask, not the gated command')
+  // A toast body has 80 cells and is cut at the tail, so a long session name
+  // must not push the tool and the reason out of sight.
+  const longApproval = approvalNotificationMessage('这是一个名字特别长的会话用来验证截断', 'Bash', '需要执行命令')
+  const [longName] = longApproval.split('：')
+  assert.ok(longName.endsWith('…'), 'a long session name ends with an ellipsis')
+  assert.ok(stringWidth(longName) <= 20, 'the session name is clipped to its own budget')
+  assert.ok(longApproval.endsWith('：Bash：需要执行命令'), 'the tool and reason survive the clip')
+  // The reason is host-provided: DSH's sandbox escalation passes the model's own
+  // justification through, so it can be arbitrary prose. It is normalized to one
+  // plain line and grapheme-capped like the completion preview, but the body makes
+  // no redaction promise - the panel keeps the full text.
+  assert.equal(
+    approvalNotificationMessage('会话 A', 'Bash', '\u001b[31m需要\u001b[0m 写文件\n第二行'),
+    '会话 A：Bash：需要 写文件 第二行',
+    'ANSI, C0 and newlines never reach the notifier as themselves',
+  )
+  assert.equal(
+    approvalNotificationMessage('会话 A', 'Bash', '理'.repeat(260)),
+    `会话 A：Bash：${'理'.repeat(199)}…`,
+    'a very long reason keeps 200 graphemes, ellipsis included',
+  )
+  // A grapheme clip must not leave half of a ZWJ emoji behind: the old code-point
+  // slice could end on the joiner and show a broken glyph.
+  const familyEmoji = '👨‍👩‍👧‍👦'
+  const graphemeName = approvalNotificationMessage(`${'家'.repeat(8)}${familyEmoji}${'x'.repeat(4)}`, 'Bash').split('：')[0]!
+  assert.equal(graphemeName, `${'家'.repeat(8)}${familyEmoji}x…`, 'the clip cuts between graphemes, never inside a ZWJ sequence')
+  assert.ok(stringWidth(graphemeName) <= 20, 'the clipped name still fits the name budget')
+
+  // Only the attached session raises an approval notification: a subagent, a
+  // background DSH agent or an ask with no attached agent parks for the panel
+  // but never becomes this window's toast. These are the production filters.
+  const noticeSession = { title: '会话 A', backendId: 'dsh' }
+  assert.equal(
+    backendApprovalNotice({ agentId: 'subagent', toolName: 'Bash', reason: '需要写文件' }, noticeSession),
+    undefined,
+    'a subagent prompt parks for the panel only',
+  )
+  assert.deepEqual(
+    backendApprovalNotice({ toolName: 'Bash', reason: '需要写文件' }, noticeSession),
+    { sessionTitle: '会话 A', toolName: 'Bash', reason: '需要写文件', backendId: 'dsh' },
+    'the attached backend prompt keeps its body facts',
+  )
+  const dshNoticeSession = { attachedAgentId: 'agent-1', title: '会话 A', backendId: 'dsh' }
+  assert.equal(
+    dshApprovalNotice({ agentId: 'agent-2', toolName: 'Bash', reason: '需要写文件' }, dshNoticeSession),
+    undefined,
+    'another DSH agent (background session or subagent) stays quiet',
+  )
+  assert.deepEqual(
+    dshApprovalNotice({ agentId: 'agent-1', toolName: 'Bash' }, dshNoticeSession),
+    { sessionTitle: '会话 A', toolName: 'Bash', backendId: 'dsh' },
+    'the attached agent\'s ask keeps its body facts',
+  )
+  assert.equal(
+    dshApprovalNotice({ agentId: 'agent-1', toolName: 'Bash' }, { ...dshNoticeSession, attachedAgentId: undefined }),
+    undefined,
+    'no attached agent means no notification',
+  )
+
+  // A notification queued before the native transport is rechecked at dispatch:
+  // the switch and the owner as before, plus the session binding and whether the
+  // approval is still parked.
+  const dispatchBase = {
+    ownerCurrent: true,
+    condition: 'always' as const,
+    announcedSessionId: 'session-1',
+    currentSessionId: 'session-1',
+  }
+  assert.equal(notificationDispatchAllowed(dispatchBase), true)
+  assert.equal(notificationDispatchAllowed({ ...dispatchBase, ownerCurrent: false }), false, 'a released channel stops pending dispatch')
+  assert.equal(notificationDispatchAllowed({ ...dispatchBase, condition: 'off' }), false, 'turning the switch off stops pending dispatch')
+  assert.equal(
+    notificationDispatchAllowed({ ...dispatchBase, currentSessionId: 'session-2' }),
+    false,
+    'a notification for a session that is no longer attached is stale',
+  )
+  assert.equal(
+    notificationDispatchAllowed({ ...dispatchBase, announcedSessionId: undefined }),
+    true,
+    'a notice with no session binding keeps the owner/switch checks',
+  )
+  assert.equal(
+    notificationDispatchAllowed({ ...dispatchBase, stillWaiting: () => false }),
+    false,
+    'an approval answered while the toast was queued is stale',
+  )
+  assert.equal(notificationDispatchAllowed({ ...dispatchBase, stillWaiting: () => true }), true)
+  assert.equal(
+    notificationDispatchAllowed({ ...dispatchBase, stillWaiting: () => { throw new Error('panel gone') } }),
+    false,
+    'a store the seam cannot read must not raise a toast',
+  )
+
+  // The one gate both notification paths ask: switch off wins, unfocused-only
+  // is quiet while focused, and a redirected stdout is never a notifier target.
+  const gateBase = { condition: 'always' as const, method: 'auto' as const }
+  assert.equal(notificationAlertsEnabled(gateBase, true, false), true)
+  assert.equal(notificationAlertsEnabled({ ...gateBase, condition: 'off' }, true, false), false, 'off silences every kind')
+  assert.equal(notificationAlertsEnabled({ ...gateBase, condition: 'unfocused' }, true, true), false, 'unfocused-only stays quiet while focused')
+  assert.equal(notificationAlertsEnabled({ ...gateBase, condition: 'unfocused' }, true, false), true, 'and notifies while unfocused')
+  assert.equal(notificationAlertsEnabled(gateBase, false, false), false, 'a redirected stdout is not a notification target')
+
+  // One clip rule serves the notification-name budget and the Windows toast
+  // body: the ellipsis occupies a cell, and graphemes are never split.
+  assert.equal(clipToWidthGraphemes('短名', 20), '短名', 'text that fits is returned unchanged')
+  assert.equal(clipToWidthGraphemes('家'.repeat(12), 20), `${'家'.repeat(9)}…`, 'the ellipsis is one of the budget cells')
+  assert.equal(clipToWidthGraphemes(`abc${familyEmoji}xyz`, 7), `abc${familyEmoji}x…`, 'the clip cuts between graphemes, not inside one')
+  // Off Windows the announcement leaves through the terminal notifier - the
+  // transport that branch alone uses. The title and the session/tool/reason
+  // body must survive the whole way into the OSC packet, and the gated command
+  // still must not ride along.
+  const posixWrites: string[] = []
+  const posixStdout = Object.assign(new Writable({
+    write(chunk, _encoding, done) { posixWrites.push(String(chunk)); done() },
+  }), { isTTY: true })
+  const posixNotifier = createTerminalNotifier(posixStdout)
+  posixNotifier.configure('always', 'auto')
+  process.env.TERM_PROGRAM = 'ghostty'
+  const approvalTitle = t('approval-notification')
+  const approvalBody = approvalNotificationMessage('会话A', 'Bash', '需要写文件')
+  posixNotifier.notify(approvalTitle, approvalBody)
+  assert.equal(getNotificationProtocol(), 'osc777')
+  const approvalPacket = posixWrites.join('')
+  // The whole packet is asserted, not just the two substrings: the gated command
+  // has no place in it either, so an extra field or a widened body goes red.
+  assert.equal(approvalPacket, osc(777, 'notify', approvalTitle, approvalBody), 'the non-Windows approval carries 「等待授权」 and 「会话A：Bash：需要写文件」 in the OSC packet')
+
+  // Every parked approval notifies once - the prompt queued behind the panel
+  // included, since each still needs its own decision. Only a park notifies:
+  // deciding or withdrawing is the answer, not a new question.
+  const approvalStores = [new PermissionStore(), new PermissionStore()]
+  const approvalParks: PermissionRequestView[][] = [[], []]
+  approvalStores.forEach((store, index) => { store.setOnPark(request => { approvalParks[index]!.push(request) }) })
+  const parkApproval = (index: number, requestId: string): void => {
+    approvalStores[index]!.park({
+      sessionId: `window-${index}`,
+      request: {
+        requestId,
+        toolName: 'Bash',
+        command: `command-${requestId}`,
+        reason: `reason-${requestId}`,
+        options: [{ id: 'allow-once', kind: 'allow-once' }, { id: 'reject', kind: 'reject' }],
+      },
+      settle: () => undefined,
+    })
+  }
+  parkApproval(0, 'first')
+  parkApproval(0, 'second')
+  assert.deepEqual(approvalParks[0]!.map(request => request.requestId), ['first', 'second'], 'a queued prompt notifies too')
+  assert.equal(approvalStores[0]!.pending().length, 2, 'notifying does not consume the queue')
+  parkApproval(1, 'other-window')
+  assert.deepEqual([approvalParks[0]!.length, approvalParks[1]!.length], [2, 1], 'each channel store notifies only its own parks')
+  approvalStores[0]!.decide('allowed-once', { optionId: 'allow-once', kind: 'allow-once' })
+  approvalStores[0]!.withdraw('window-0', 'second')
+  assert.equal(approvalParks[0]!.length, 2, 'decide and withdraw never re-announce')
+  approvalStores[0]!.setOnPark(undefined)
+  parkApproval(0, 'unobserved')
+  assert.equal(approvalParks[0]!.length, 2, 'an unset observer announces nothing')
+  assert.equal(approvalStores[0]!.pending()[0]?.requestId, 'unobserved', 'an unset observer leaves the store unchanged')
+  approvalStores[0]!.setOnPark(() => { throw new Error('notification failed') })
+  parkApproval(0, 'throwing')
+  assert.ok(approvalStores[0]!.pending().some(request => request.requestId === 'throwing'), 'a throwing observer leaves the approval parked')
+  approvalStores[0]!.decide('allowed-once', { optionId: 'allow-once', kind: 'allow-once' })
+  approvalStores[0]!.decide('allowed-once', { optionId: 'allow-once', kind: 'allow-once' })
+  assert.equal(approvalStores[0]!.pending().length, 0, 'the queue still drains after a throwing observer')
+
+  // The waiting-question body is the first question's header and question, in
+  // that order: blank parts are dropped and options, detail and link stay in
+  // the panel.
+  assert.equal(
+    questionNotificationMessage([{ id: 'database', header: '数据库', question: 'Which one?' }]),
+    '数据库：Which one?',
+  )
+  assert.equal(questionNotificationMessage([{ id: 'continue', question: '要继续吗？' }]), '要继续吗？')
+  assert.equal(
+    questionNotificationMessage([{ id: 'trimmed', header: ' 数据库 ', question: '\t要继续吗？ ' }]),
+    '数据库：要继续吗？',
+    'the header and the question are trimmed',
+  )
+  assert.equal(
+    questionNotificationMessage([{ id: 'blank', header: '   ', question: ' \t ' }]),
+    '',
+    'a prompt with nothing to say announces nothing',
+  )
+  assert.equal(
+    questionNotificationMessage([
+      {
+        id: 'first',
+        header: '数据库',
+        question: 'Which one?',
+        options: [{ label: 'Postgres', description: 'relational' }],
+        detail: 'the schema under review',
+        link: 'https://example.invalid/schema',
+      },
+      { id: 'second', header: '忽略', question: 'Not this one' },
+    ]),
+    '数据库：Which one?',
+    'only the first question contributes; options, detail and link stay in the panel',
+  )
+  assert.equal(questionNotificationMessage([]), '', 'an empty ask announces nothing')
+  // The header and the question are host- or model-authored: the same
+  // normalization every notification body gets (ANSI/C0 stripped, whitespace
+  // folded, 200-grapheme cap) keeps them on one line and inside the budget.
+  assert.equal(
+    questionNotificationMessage([{ id: 'ansi', header: '\u001b[1m数据库\u001b[0m', question: ' 先写文件\n再问我 ' }]),
+    '数据库：先写文件 再问我',
+    'question parts are normalized like the approval body',
+  )
+  assert.equal(
+    questionNotificationMessage([{ id: 'long', question: '问'.repeat(260) }]),
+    `${'问'.repeat(199)}…`,
+    'a very long question keeps 200 graphemes, ellipsis included',
+  )
+  // Which title an ask uses, whether it is announced at all, and whether an
+  // external notifier owns it, is decided by the notice; the body assertions
+  // above only cover formatting.
+  assert.deepEqual(
+    questionNotice([{ id: 'database', header: '数据库', question: 'Which one?' }]),
+    { titleKey: 'question-notification', message: '数据库：Which one?', yieldToExternal: true },
+    'an answerable ask carries the waiting-question title and the body, and yields to an external notifier',
+  )
+  assert.equal(
+    questionNotice([{ id: 'blank', header: '   ', question: ' \t ' }]),
+    undefined,
+    'a prompt with nothing to say announces nothing',
+  )
+  // The 0.2.2 `approval` intent is the ordinary question layout with
+  // caller-named options, so it is announced as a waiting question rather than
+  // silently dropped by the plan-review rule.
+  assert.deepEqual(
+    questionNotice([{
+      id: 'approve',
+      header: '权限',
+      question: '允许本次操作？',
+      intent: { kind: 'approval', approve: '允许', reject: '拒绝' },
+    }]),
+    { titleKey: 'question-notification', message: '权限：允许本次操作？', yieldToExternal: true },
+    'an approval-intent ask is announced as a waiting question',
+  )
+  // The per-ask guard lives in the production notice function: a subagent's
+  // question parks for the panel, never for this window's toast; and on the
+  // legacy `registerProvider` hosts the store receives every in-process
+  // session's ask, so the DSH protocol's structural `agent` must match the
+  // attached one. An agentless wizard request has nothing to compare and keeps
+  // notifying, as does an ask with no owner at all.
+  assert.equal(
+    waitingQuestionNotice({ agentId: 'agent-1', questions: [{ id: 'sub', question: 'Proceed?' }] }),
+    undefined,
+    'a subagent question stays in the panel',
+  )
+  assert.equal(
+    waitingQuestionNotice({ questions: [{ id: 'q', question: '继续吗？' }], agent: { id: 'agent-2' } }, 'agent-1'),
+    undefined,
+    'another agent\'s question (a background session on legacy hosts) stays in the panel',
+  )
+  assert.equal(
+    waitingQuestionNotice({ questions: [{ id: 'q', question: '继续吗？' }], agent: { id: 'agent-2' } }),
+    undefined,
+    'an unknown attached agent must not announce another agent\'s ask',
+  )
+  assert.deepEqual(
+    waitingQuestionNotice({ questions: [{ id: 'q', header: '数据库', question: 'Which one?' }], agent: { id: 'agent-1' } }, 'agent-1'),
+    { titleKey: 'question-notification', message: '数据库：Which one?', yieldToExternal: true },
+    'the DSH owner shape compares equal to the attached agent',
+  )
+  assert.deepEqual(
+    waitingQuestionNotice({ questions: [{ id: 'q', header: '数据库', question: 'Which one?' }] }, 'agent-1'),
+    { titleKey: 'question-notification', message: '数据库：Which one?', yieldToExternal: true },
+    'the attached ask keeps its title mapping and body',
+  )
+  assert.deepEqual(
+    waitingQuestionNotice({ questions: [{ id: 'q', header: '数据库', question: 'Which one?' }] }),
+    { titleKey: 'question-notification', message: '数据库：Which one?', yieldToExternal: true },
+    'an agentless wizard request still notifies',
+  )
+  assert.equal(
+    waitingQuestionNotice({ questions: [{ id: 'plan', question: 'Approve?', intent: { kind: 'plan-review', approve: 'Approve' } }], agent: { id: 'agent-2' } }, 'agent-1'),
+    undefined,
+    'another session\'s plan review stays in the panel on legacy hosts',
+  )
+  assert.deepEqual(
+    waitingQuestionNotice({ questions: [{ id: 'plan', header: '计划', question: 'Approve?', intent: { kind: 'plan-review', approve: 'Approve' } }], agent: { id: 'agent-1' } }, 'agent-1'),
+    { titleKey: 'plan-review-notification', message: '计划：Approve?', yieldToExternal: false },
+    'the attached session\'s plan review keeps its own title and in-house opt-out',
+  )
+  assert.equal(waitingQuestionNotice({ questions: [{ id: 'blank', question: '  ' }] }), undefined, 'an empty ask announces nothing')
+  assert.deepEqual(
+    waitingQuestionNotice({ questions: [{ id: 'plan', header: '计划', question: 'Approve?', intent: { kind: 'plan-review', approve: 'Approve' } }] }),
+    { titleKey: 'plan-review-notification', message: '计划：Approve?', yieldToExternal: false },
+    'the production guard keeps the plan review title and its in-house opt-out together',
+  )
+  assert.deepEqual(
+    questionNotice([{ id: 'plan', header: '计划', question: 'Approve?', intent: { kind: 'plan-review', approve: 'Approve' } }]),
+    { titleKey: 'plan-review-notification', message: '计划：Approve?', yieldToExternal: false },
+    'a plan review is announced under its own title and keeps the notice in-house',
+  )
+  assert.deepEqual(
+    questionNotice([
+      { id: 'first', header: '数据库', question: 'Which one?' },
+      { id: 'plan', header: '计划', question: 'Approve?', intent: { kind: 'plan-review', approve: 'Approve' } },
+    ]),
+    { titleKey: 'plan-review-notification', message: '数据库：Which one?', yieldToExternal: false },
+    'any question carrying a plan review takes the plan review title, not only the first',
+  )
+  assert.equal(
+    questionNotice([{ id: 'blank', header: '   ', question: ' \t ', intent: { kind: 'plan-review', approve: 'Approve' } }]),
+    undefined,
+    'a plan review with nothing to say announces nothing',
+  )
+  // The notice, the per-ask guard and the opt-out are production code; the
+  // only piece apply() composes itself is the one-line store registration.
+
+  // Every ask batch notifies once, a queued one included, since each still
+  // blocks the session. Answering or interrupting is the answer, not a new
+  // question. A throwing observer must leave the ask parked and answerable.
+  const questionStore = new QuestionStore()
+  const asked: string[] = []
+  questionStore.setOnAsk(request => { asked.push(request.questions[0]!.question) })
+  const firstQuestion = { questions: [{ id: 'first', question: '第一条' }] }
+  const secondQuestion = { questions: [{ id: 'second', question: '第二条' }] }
+  const firstAsk = questionStore.ask(firstQuestion)
+  const secondAsk = questionStore.ask(secondQuestion)
+  assert.deepEqual(asked, ['第一条', '第二条'], 'a queued ask notifies once too')
+  assert.equal(questionStore.hasPendingRequest(firstQuestion), true, 'the shown ask is pending')
+  assert.equal(questionStore.hasPendingRequest(secondQuestion), true, 'a queued ask is pending too')
+  assert.equal(questionStore.getSnapshot()?.question.id, 'first', 'notifying does not skip the queue')
+  questionStore.answerCurrent({ selected: [] })
+  await firstAsk
+  assert.equal(questionStore.hasPendingRequest(firstQuestion), false, 'an answered ask stops being pending')
+  assert.deepEqual(asked, ['第一条', '第二条'], 'answering never re-announces')
+  assert.equal(questionStore.getSnapshot()?.question.id, 'second', 'the queued ask is shown after the first settles')
+  questionStore.answerCurrent({ selected: [] })
+  await secondAsk
+  assert.equal(questionStore.hasPendingRequest(secondQuestion), false, 'the drained ask stops being pending')
+  assert.deepEqual(asked, ['第一条', '第二条'], 'a draining queue does not repeat notifications')
+  questionStore.setOnAsk(undefined)
+  const unobserved = questionStore.ask({ questions: [{ id: 'unobserved', question: '第三条' }] })
+  assert.equal(asked.length, 2, 'an unset observer announces nothing')
+  assert.equal(questionStore.getSnapshot()?.question.id, 'unobserved', 'an unset observer leaves the ask parked')
+  questionStore.answerCurrent({ selected: [] })
+  await unobserved
+  questionStore.setOnAsk(() => { throw new Error('notification failed') })
+  const throwingAsk = questionStore.ask({ questions: [{ id: 'throwing', question: '第四条' }] })
+  assert.equal(questionStore.getSnapshot()?.question.id, 'throwing', 'a throwing observer leaves the ask parked')
+  questionStore.cancelCurrent()
+  await assert.rejects(
+    throwingAsk,
+    { name: 'QuestionInterruptedError', code: 'ASK_CANCELLED' },
+    'the interrupted ask still rejects through the store',
+  )
+  assert.equal(questionStore.getSnapshot(), null, 'the queue drains after a throwing observer')
+
+  // A backend stamps the asking subagent on the event; the channel bridge
+  // rebuilds the request field by field and plugin.ts's setOnAsk drops subagent
+  // asks by reading this field. Losing it would silently re-announce every
+  // subagent question, so drive the real bridge: a direct store call would
+  // still pass with the projection dropping the value.
+  const bridgedQuestions = new QuestionStore()
+  const askedAgentIds: (string | undefined)[] = []
+  bridgedQuestions.setOnAsk(request => { askedAgentIds.push(request.agentId) })
+  const questionLink = attachInteraction(
+    { permissions: new PermissionStore(), questions: bridgedQuestions, debug: () => undefined },
+    { sessionId: 'subagent-ask', capabilities: {} },
+  )
+  questionLink.apply([{
+    type: 'question.request',
+    request: { requestId: 'subagent', agentId: 'agent-1', questions: [{ question: 'Proceed?', options: [] }] },
+  }])
+  assert.deepEqual(askedAgentIds, ['agent-1'], 'the asking subagent reaches the store observer, where the notice guard reads it')
+  bridgedQuestions.cancelCurrent()
+  questionLink.release()
+
+  const [React, { Terminal }, { render, Text, AlternateScreen, useInput }, { settled }] = await Promise.all([
+    import('react'), import('@xterm/headless'), import('../src/ui.js'), import('./lib/term-test.mjs'),
+  ])
+  for (const [fullscreen, method] of [[false, 'auto'], [true, 'auto'], [false, 'osc9'], [true, 'osc9']] as const) {
+    process.env.TERM_PROGRAM = 'ghostty'
+    const term = new Terminal({ cols: 36, rows: 8, allowProposedApi: true })
+    const notifications: { title?: string; message: string }[] = []
+    term.parser.registerOscHandler(9, data => {
+      if (!data.startsWith('4;')) notifications.push({ message: data })
+      return true
+    })
+    term.parser.registerOscHandler(777, data => {
+      assertReceiverBudget(data)
+      const [command, title, ...body] = data.split(';')
+      assert.equal(command, 'notify')
+      notifications.push({ title, message: body.join(';') })
+      return true
+    })
+    class Input extends PassThrough {
+      isTTY = true
+      raw = false
+      setRawMode(raw: boolean): this { this.raw = raw; return this }
+      ref(): this { return this }
+      unref(): this { return this }
+    }
+    const input = new Input()
+    const output = Object.assign(new Writable({
+      write(chunk, _encoding, done) { term.write(String(chunk), done) },
+    }), { isTTY: true, columns: 36, rows: 8 })
+    const transport = createTerminalNotifier(output)
+    transport.configure('unfocused', method)
+    function Probe() {
+      useInput(() => {})
+      return React.createElement(Text, null, 'screen remains intact')
+    }
+    const content = React.createElement(Probe)
+    const instance = await render(fullscreen ? React.createElement(AlternateScreen, null, content) : content, {
+      stdin: input, stdout: output, stderr: output, patchConsole: false, exitOnCtrlC: false,
+    })
+    const session = new FakeSession(`render-${fullscreen}`)
+    const rendered = createChannel(ctx, session, {
+      model: 'fake', provider: '', cwd: session.cwd, activity: false,
+      onTaskComplete: preview => transport.notify(t('task-complete-notification'), preview),
+    })
+    const screen = (): string => Array.from({ length: 8 }, (_, row) => term.buffer.active.getLine(row)?.translateToString(true) ?? '').join('\n')
+    try {
+      assert.ok(await settled(() => screen().includes('screen remains intact') && input.raw))
+      const before = screen()
+      input.write('\x1b[O')
+      assert.ok(await settled(() => getTerminalFocusState() === 'blurred'))
+      session.start(0)
+      session.reply(0, '# 最新 AI 回复\n\n**已完成修复**', 1)
+      session.end(0)
+      session.idle()
+      assert.ok(await settled(() => notifications.length === 1))
+      assert.deepEqual(notifications[0], method === 'auto'
+        ? { title: 'dsh-TUI · 任务已完成', message: '最新 AI 回复 已完成修复' }
+        : { message: 'dsh-TUI · 任务已完成: 最新 AI 回复 已完成修复' })
+      assert.equal(screen(), before, `${fullscreen ? 'fullscreen' : 'inline'} notification leaves the narrow screen intact`)
+      input.write('\x1b[I')
+      assert.ok(await settled(() => getTerminalFocusState() === 'focused'))
+      session.start(1)
+      session.end(1)
+      session.idle()
+      await nextDispatch()
+      assert.equal(notifications.length, 1, 'real focus-in suppresses delivery')
+      input.write('\x1b[O')
+      assert.ok(await settled(() => getTerminalFocusState() === 'blurred'))
+      session.start(2)
+      session.end(2)
+      session.idle()
+      assert.ok(await settled(() => notifications.length === 2))
+      assert.deepEqual(notifications[1], method === 'auto'
+        ? { title: 'dsh-TUI · 任务已完成', message: '' }
+        : { message: 'dsh-TUI · 任务已完成' }, 'a reply-less task displays only its title')
+    } finally {
+      rendered.releaseContributions()
+      instance.unmount()
+      assert.equal(input.raw, false, 'exit restores raw mode')
+      term.dispose()
+    }
+  }
+  console.log('verify-task-notifications OK')
+} finally {
+  channel.releaseContributions()
+  resetTerminalFocusState()
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+}

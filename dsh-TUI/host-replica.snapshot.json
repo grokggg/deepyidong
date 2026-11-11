@@ -1,0 +1,13 @@
+{
+  "hostVersion": "0.2.2-rc.1",
+  "replicas": {
+    "process-shutdown": "25c966fcb5ab8e58e31c2610ccec3360b0cb2069bbef844640d5afdf27aebe5c",
+    "process-shutdown-timeout": "25c966fcb5ab8e58e31c2610ccec3360b0cb2069bbef844640d5afdf27aebe5c",
+    "app-ready": "25c966fcb5ab8e58e31c2610ccec3360b0cb2069bbef844640d5afdf27aebe5c",
+    "compose-profile": "25c966fcb5ab8e58e31c2610ccec3360b0cb2069bbef844640d5afdf27aebe5c",
+    "run-profile": "25c966fcb5ab8e58e31c2610ccec3360b0cb2069bbef844640d5afdf27aebe5c",
+    "boot": "346f832224737cd9ab1b5e37d111ae232fdd78b5ab892fa3179c112baf6f0a22",
+    "startup-report": "b6640801a5a65aae9f53ca21bcce3b2ea28bd9e9554c939c1ff7c4448d91fa18",
+    "run-cli": "b6640801a5a65aae9f53ca21bcce3b2ea28bd9e9554c939c1ff7c4448d91fa18"
+  }
+}

@@ -1,0 +1,136 @@
+import React, { useState } from 'react'
+import { Box, Text } from '../../ui.js'
+import { t } from '../../i18n.js'
+import type { ClickEvent } from '../../ink/events/click-event.js'
+import type { ContextMenuEvent } from '../../ink/events/context-menu-event.js'
+import { stringWidth } from '../../ink/stringWidth.js'
+import { spreadRow, truncateWidth } from '../../sessions/format.js'
+import { useDeclaredCursor, useNativeCursor } from '../../ink/hooks/use-declared-cursor.js'
+
+/**
+ * One workspace in the home screen's left rail.
+ *
+ * A single name-and-count line at every terminal width. The selected
+ * workspace path lives above the panes, where it has the full screen width
+ * instead of repeating a truncated path under every name.
+ */
+export function HomeWorkspaceRow({
+  title,
+  sessionCount,
+  historyOnly = false,
+  present,
+  selected,
+  focused,
+  declareCursor = false,
+  width,
+  onSelect,
+  onMenu,
+}: {
+  title: string
+  sessionCount: number
+  /** Derived from session history, without a workspace registration. */
+  historyOnly?: boolean
+  /** False when the recorded directory no longer exists. */
+  present: boolean
+  /** Whether this workspace's sessions are the ones on the right. */
+  selected: boolean
+  /** Keyboard cursor. */
+  focused: boolean
+  /** Park the native caret on this row while the rail owns it. */
+  declareCursor?: boolean
+  /** Columns available to the row. */
+  width: number
+  /** Left click: show this workspace's sessions (same path as Enter). */
+  onSelect?(event: ClickEvent): void
+  /** Right click: open the workspace action menu. */
+  onMenu?(event: ContextMenuEvent): void
+}): React.ReactNode {
+  const [hovered, setHovered] = useState(false)
+  const nativeCursor = useNativeCursor()
+  const cursorRef = useDeclaredCursor({ line: 0, column: 0, active: focused && declareCursor, visible: nativeCursor, hideOnIdle: true })
+  const body = Math.max(8, width - 4)
+  // The pane already labels the count; keep the rail's badge numeric and use
+  // its selected ring rather than a second check mark for the same state.
+  const count = String(sessionCount)
+  const ring = selected ? '▣' : '▢'
+  const history = t('supervisor-history-only')
+  const shortHistory = t('supervisor-history-only-short')
+  const missingBadge = `${t('home-workspace-missing')} · ${count}`
+  const compactMissingBadge = `${t('home-workspace-missing')} ${count}`
+  // Reserve room for the ring, an identifiable name and (where needed) the
+  // history marker. Fall back to a warning glyph if the text cannot fit.
+  const minimumName = stringWidth(`${ring} ${historyOnly ? `${shortHistory} ` : ''}界…`)
+  const fits = (value: string): boolean => stringWidth(value) + 1 + minimumName <= body
+  const badge = present ? count : fits(missingBadge) ? missingBadge : fits(compactMissingBadge) ? compactMissingBadge : `! ${count}`
+  const nameWidth = Math.max(0, body - stringWidth(badge) - 1)
+  const fullName = `${ring} ${historyOnly ? `${history} · ${title}` : title}`
+  // Shorten the history prefix when needed, preserving both the label and
+  // the beginning of the project name rather than truncating either away.
+  const name = historyOnly && stringWidth(fullName) > nameWidth ? `${ring} ${shortHistory} ${title}` : fullName
+  const headingName = truncateWidth(name, nameWidth)
+  const heading = spreadRow(headingName, badge, body)
+  // The cursor (green) outranks the selection ring (green); both outrank the
+  // idle colour. Blue is not part of this ladder at all — see the background.
+  const headingColor = (focused || selected) ? 'success' : present ? 'text' : 'inactive'
+
+  return (
+    <Box
+      flexDirection="column"
+      flexShrink={0}
+      paddingX={1}
+      onClick={onSelect}
+      onContextMenu={onMenu}
+      onMouseEnter={onSelect === undefined && onMenu === undefined ? undefined : () => setHovered(true)}
+      onMouseLeave={onSelect === undefined && onMenu === undefined ? undefined : () => setHovered(false)}
+      // Hover is the BLUE prompt — pointer feedback and nothing else, so it
+      // never marks the focused or the selected row. Selection itself is green
+      // in the text, which is why this row draws no box while selected.
+      backgroundColor={hovered && !focused ? 'userMessageBackgroundHover' : undefined}
+    >
+      <Box ref={cursorRef} height={1} flexShrink={0} overflow="hidden">
+        <Text color={focused ? 'success' : 'subtle'}>{focused ? '❯ ' : '  '}</Text>
+        <Text color={headingColor} bold={focused || selected}>
+          {heading.left}
+        </Text>
+        <Text dimColor={!focused}>{`${' '.repeat(heading.gap)}${heading.right}`}</Text>
+      </Box>
+    </Box>
+  )
+}
+
+/**
+ * The `+` row that opens the directory picker.
+ *
+ * Deliberately the FIRST row of the rail and always clickable: adding a
+ * workspace is the rail's only creation action, and a control that is only
+ * reachable by keyboard is a control most users never find in a terminal.
+ */
+export function HomeAddWorkspaceRow({
+  focused,
+  width,
+  onOpen,
+}: {
+  focused: boolean
+  width: number
+  onOpen?(event: ClickEvent): void
+}): React.ReactNode {
+  const [hovered, setHovered] = useState(false)
+  const body = Math.max(8, width - 4)
+  return (
+    <Box
+      flexDirection="column"
+      flexShrink={0}
+      paddingX={1}
+      onClick={onOpen}
+      onMouseEnter={onOpen === undefined ? undefined : () => setHovered(true)}
+      onMouseLeave={onOpen === undefined ? undefined : () => setHovered(false)}
+      backgroundColor={focused || hovered ? 'userMessageBackgroundHover' : undefined}
+    >
+      <Box height={1} flexShrink={0} overflow="hidden">
+        <Text color={focused ? 'suggestion' : 'subtle'}>{focused ? '❯ ' : '  '}</Text>
+        <Text color="remember" bold>{`＋ ${t('home-add-workspace')}`}</Text>
+      </Box>
+      <Text dimColor wrap="truncate-end">{`  ${truncateWidth(t('home-add-hint'), body - 2)}`}</Text>
+    </Box>
+  )
+}
